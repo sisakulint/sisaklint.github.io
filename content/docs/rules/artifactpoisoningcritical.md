@@ -1,42 +1,113 @@
 ---
 title: "Artifact Poisoning Rule（Critical）"
 weight: 8
-# bookFlatSection: false
-# bookToc: true
-# bookHidden: false
-# bookCollapseSection: false
-# bookComments: false
-# bookSearchExclude: false
 ---
 
-### Artifact Poisoning Rule （Critical） Overview
+This page describes sisakulint [v0.3.7](https://github.com/sisaku-security/sisakulint/releases/tag/v0.3.7).
 
-This rule detects unsafe artifact download practices that may allow artifact poisoning attacks. Artifact poisoning occurs when malicious artifacts from untrusted sources overwrite existing files in the runner workspace, potentially leading to code execution in privileged contexts.
+## Overview
 
-#### Key Features:
+`artifact-poisoning-critical` reports steps whose `uses:` begins with
+`actions/download-artifact@`, and only where three conditions hold together. The job checks out the repository. The job can run under a trigger this
+rule treats as a risk signal, or the step is configured to reach another run — either one is
+enough for that condition. And the destination is one the rule judges unsafe: the workspace, or
+an absolute path its list for the runner OS does not accept. The destination alone does not
+produce a finding.
 
-- **Artifact Download Detection**: Identifies uses of `actions/download-artifact` without proper path isolation
-- **Extraction Path Validation**: Ensures artifacts are extracted to safe, isolated locations
-- **OS-Aware Path Analysis**: Detects runner OS from `runs-on` labels and applies OS-specific path safety rules
-- **Auto-fix Support**: Automatically configures safe extraction paths using `${{ runner.temp }}/artifacts`
-- **Supply Chain Protection**: Prevents malicious artifacts from compromising the build environment
+If an artifact produced by a less-trusted run overwrites the checked-out source, a later step may
+execute it. This rule looks only at where the artifact lands; it never reads its contents.
 
-### Security Impact
+## Detection Scope
 
-**Severity: Critical (9/10)**
+Reported only when all three hold. If any one is missing, nothing is reported.
 
-Artifact poisoning represents a critical security vulnerability in CI/CD pipelines:
+1. **The job contains `actions/checkout@`.** This narrows the rule to jobs that have a
+   checked-out source to overwrite; it does not mean a job without checkout is safe. A workflow that writes a file with `run:`,
+   extracts an artifact over the same location, and executes it afterwards is not reported.
+2. **The job can run under a trigger this rule treats as a risk signal, or the step is
+   configured to reach another run.** Either one is enough.
 
-1. **File Overwriting**: Malicious artifacts can replace legitimate files in the workspace
-2. **Code Execution**: Overwritten scripts or binaries may be executed by subsequent steps
-3. **Credential Theft**: Modified code can exfiltrate secrets or access tokens
-4. **Build Contamination**: Compromised builds can propagate malicious code to production
+   - Triggers treated as a risk signal: `workflow_run` / `pull_request_target` / `issue_comment` /
+     `issues` / `discussion_comment` / `pull_request_review` / `workflow_call`. Membership says
+     what the rule reacts to, not what the run is granted: a `pull_request_review` on a pull
+     request from a fork runs with a read-only `GITHUB_TOKEN` and without access to other secrets.
+   - The workflow's triggers are read per job. A job-level `if:` that the rule can read as a test
+     on the event name narrows the set for that job, so `if: github.event_name == 'push'` takes
+     the job off this list even while the workflow also has `pull_request_target`. A condition the
+     rule cannot read that way leaves every trigger in place. Which conditions it reads is not
+     stated here; run the rule again after changing one and see whether the finding is gone.
+   - Reaching another run: **a `github-token` is present, and** `run-id` or `repository` points
+     somewhere other than this run.
 
-This vulnerability is classified as **CWE-829: Inclusion of Functionality from Untrusted Control Sphere** and aligns with OWASP CI/CD Security Risk **CICD-SEC-4: Poisoned Pipeline Execution (PPE)**.
+   Two configurations do not reach another run: a `run-id` with no `github-token`, because the
+   action reads only the current run when no token is supplied; and a self-reference such as
+   `run-id: ${{ github.run_id }}`. Either is still reported if the job can run under a trigger on
+   the list above — that half of the condition is enough on its own.
+3. **The destination is unsafe.** `path` is absent, empty, workspace-relative, or judged unsafe
+   for the runner OS. Which absolute paths count as unsafe depends on the OS the job runs on;
+   the table is under [OS-Aware Path Validation](#os-aware-path-validation) below.
 
-### Example Workflow
+This rule emits no severity. A finding carries the file position, the message, and the rule
+name only. (The output format is capable of carrying one: the `artipacked` rule prints
+`[Medium]` in the same run.) The `-critical` in the rule name is part of the identifier, not an independent
+rating of this rule.
 
-Consider the following vulnerable workflow that downloads artifacts unsafely:
+Not examined: the contents of the artifact, the dependencies that produced it, or its
+provenance. Supply-chain compromise is outside this rule and belongs to dependency scanning and
+provenance verification. Who can produce the artifact is also not examined. The trigger set is
+the rule's own risk signal, not a test of what the run is granted. It does not decide whether the
+step can reach another run's artifact; that is settled by `github-token` together with `run-id` /
+`repository` (see [Security Background](#security-background)).
+
+## Remediation
+
+1. **Extract under `${{ runner.temp }}`.** The runner's own temporary directory is the one
+   destination that does not depend on where the runner places the workspace. Only the
+   `${{ runner.temp }}` expression is accepted for it; whitespace and letter case inside
+   `${{ }}` are ignored, so `${{runner.temp}}` and `${{ RUNNER.TEMP }}` are accepted as well. A
+   literal `$RUNNER_TEMP` is reported — `with:` inputs are not shell-expanded, so the action
+   receives the string as written. The expression is rejected when a `..` segment follows.
+
+   ```yaml
+   - uses: actions/download-artifact@v4
+     with:
+       name: application-bundle
+       path: ${{ runner.temp }}/artifacts
+   ```
+
+   Omitting `path` extracts into `$GITHUB_WORKSPACE` (the action's documented default). When
+   referencing the destination from `run:`, pass it through `env:` and quote it so shell
+   differences do not change the meaning.
+
+   Setting `path` works here because this rule only looks at `actions/download-artifact`, which
+   documents the input and reads it. A third-party action need not — that case belongs to
+   [`artifact-poisoning-medium`]({{< ref "artifactpoisoningmedium.md" >}}), where `path` does not
+   clear the finding for that reason.
+
+2. **If `path` is absent or empty, the autofix applies.** Run `sisakulint -fix on`. A step that
+   already has an unsafe `path` is reported but not rewritten (see Auto-fix).
+
+3. **Read from the temporary directory.** Copy into the workspace only what you have verified.
+   Moving the destination stops the overwrite; it does not make the artifact trustworthy.
+
+Removing the checkout also clears the finding, but that silences this rule rather than changing
+what can happen — Detection Scope's first condition already says a job without a checkout is not
+thereby safe. The second condition is an *or*, so clearing that one instead means removing both of
+the things that satisfy it: the risk-signal trigger and the cross-run configuration (`run-id` /
+`repository` together with `github-token`). For the trigger, either take it out of `on:` or give
+the job an `if:` the rule can read as a test on the event name. Each of these changes when the job
+runs or what it does (see Detection Scope).
+
+## Auto-fix
+
+What this rule's autofix changes, and what it leaves alone.
+
+- **Changes**: steps whose `path` is absent or empty. Inserts `path: ${{ runner.temp }}/artifacts`.
+- **Leaves alone**: steps that already carry an unsafe `path`. Rewriting could break an
+  intended layout, so the step is reported only.
+- No verification step is generated. Only the destination is changed.
+
+## Example Workflow the Rule Detects
 
 ```yaml
 name: Deploy Application
@@ -50,14 +121,20 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
     steps:
-      # VULNERABLE: No path specified, downloads to current directory
+      - uses: actions/checkout@v4
+
+      # REPORTED: no path, so the artifact lands in the checked-out workspace
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: application-bundle
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # DANGEROUS: Executes scripts from downloaded artifacts
       - name: Deploy to production
         run: |
           chmod +x ./deploy.sh
@@ -66,48 +143,26 @@ jobs:
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
 ```
 
-### Attack Scenario
-
-**How Artifact Poisoning Works:**
-
-1. **Attacker Creates Malicious PR**: Opens a pull request with seemingly innocent changes
-2. **Build Workflow Runs**: CI workflow builds the PR and uploads artifacts
-3. **Malicious Artifact Created**: Attacker includes a malicious `deploy.sh` in the artifact
-4. **Deploy Workflow Triggered**: Downstream workflow downloads the artifact
-5. **Files Overwritten**: Malicious `deploy.sh` overwrites the legitimate deployment script
-6. **Code Execution**: Deploy workflow executes the malicious script with production credentials
-7. **Compromise**: Attacker gains access to production environment and secrets
-
-This attack is particularly dangerous because:
-- The deploy workflow may run with write permissions or production access
-- Artifacts appear to come from the same repository (trusted source)
-- Traditional security scanners don't inspect artifact contents
-- The malicious code executes in a privileged context
-
-### Example Output
-
-Running sisakulint will detect unsafe artifact downloads:
+## Example Output
 
 ```bash
-$ sisakulint
-
-.github/workflows/deploy.yaml:12:9: artifact is downloaded without specifying a safe extraction path at step "Download build artifacts". This may allow artifact poisoning where malicious files overwrite existing files. Consider extracting to a temporary folder like '${{ runner.temp }}/artifacts' to prevent overwriting existing files. See https://codeql.github.com/codeql-query-help/actions/actions-artifact-poisoning-critical/ [artifact-poisoning]
-     12 👈|      - name: Download build artifacts
+.github/workflows/deploy.yaml:19:9: artifact is downloaded without specifying a safe extraction path at step "Download build artifacts". This may allow artifact poisoning where malicious files overwrite existing files. Consider extracting to a temporary folder like '${{ runner.temp }}/artifacts' to prevent overwriting existing files. See https://sisaku-security.github.io/lint/docs/rules/artifactpoisoningcritical/ [artifact-poisoning-critical]
+       19 👈|      - name: Download build artifacts
 ```
 
-### Auto-fix Support
+Only this rule's finding is shown; other rules report on the same run. A third line under each
+finding (a column pointer, all spaces) is omitted here.
 
-The artifact-poisoning rule supports auto-fixing by adding safe extraction paths:
+## Example Workflow the Rule Does Not Detect
 
-```bash
-# Preview changes without applying
-sisakulint -fix dry-run
+Condition 3 of Detection Scope no longer holds, so this rule reports nothing. This is the same
+workflow as above with only the destination changed to one the rule accepts.
 
-# Apply fixes
-sisakulint -fix on
-```
-
-After auto-fix, artifacts are extracted to an isolated temporary directory:
+**All this example shows is that the overwrite is stopped.** The artifact itself can still be
+produced by a less-trusted party. Checking it against a `checksums.txt` carried inside the same
+artifact verifies nothing, because an attacker able to change the contents can change the list
+too. Whether the contents can be trusted is handled by other controls, such as signature or
+provenance verification, and is outside this rule.
 
 ```yaml
 name: Deploy Application
@@ -121,366 +176,155 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
     steps:
-      # SECURE: Artifacts isolated in temporary directory
+      - uses: actions/checkout@v4
+
+      # NOT REPORTED: extracted outside the workspace
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: application-bundle
           path: ${{ runner.temp }}/artifacts
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # SECURE: Reference files from isolated location
-      - name: Verify artifact contents
-        run: |
-          # Validate artifact integrity before use
-          sha256sum -c ${{ runner.temp }}/artifacts/checksums.txt
-
+      # The deploy script comes from the repository, not from the artifact.
       - name: Deploy to production
         run: |
-          # Copy only verified files to workspace
-          cp ${{ runner.temp }}/artifacts/app.tar.gz .
-          tar -xzf app.tar.gz
           chmod +x ./deploy.sh
           ./deploy.sh
         env:
+          ARTIFACT_DIR: ${{ runner.temp }}/artifacts
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
 ```
 
-### Best Practices
+## Security Impact
 
-#### 1. Always Specify Extraction Path
+The classification corresponds to CWE-829 and OWASP CICD-SEC-4. The tool emits no severity, so
+no number is given here (see Detection Scope).
 
-Use `runner.temp` to isolate artifacts from the workspace:
+**The impact is conditional.** A finding means only that the destination is one this rule's list
+for the runner OS does not accept — the workspace, or an absolute path off that list. It does
+not mean the destination is inside the workspace: a destination plainly outside it is still
+reported when it is not on the list, such as `/tmp` on Windows, `C:\artifacts` on any OS, or
+`/var/...` when the OS cannot be inferred. This rule does not look at what runs afterwards, nor
+at what credentials the job holds. When a later step executes the overwritten file and the job
+carries production credentials, the attacker's code runs with those privileges. Deployment
+workflows tend to satisfy both, and the artifact appears to originate from the same repository,
+which makes it easy to miss. Without those two, a finding means only that the destination is off
+the list.
 
-```yaml
-- uses: actions/download-artifact@v4
-  with:
-    name: my-artifact
-    path: ${{ runner.temp }}/artifacts  # Isolated directory
-```
+## Security Background
 
-#### 2. Treat Artifacts as Untrusted
+`actions/download-artifact` reads artifacts from the current repository and the current run by
+default. Reaching another repository or another run requires a `github-token` — the action's
+input documentation states it is required when downloading from a different repository or a
+different workflow run. What determines whether another run is reachable is therefore the
+combination of `github-token` with `run-id` / `repository`, not the kind of trigger.
 
-Never execute artifact contents directly. Always validate first:
+The trigger carries a different axis. `workflow_run` and `pull_request_target` can start a
+workflow, in response to a pull request from a fork, in a context that holds write permissions
+and secrets. The overwrite becomes possible where the two overlap: a privileged context
+extracting, into the workspace, an artifact a less-trusted party could have produced.
 
-```yaml
-- name: Validate artifact
-  run: |
-    # Check file signatures
-    gpg --verify ${{ runner.temp }}/artifacts/app.sig ${{ runner.temp }}/artifacts/app
+## Attack Scenario
 
-    # Verify checksums
-    sha256sum -c ${{ runner.temp }}/artifacts/checksums.txt
+1. An attacker opens a pull request; CI builds the PR's code and uploads an artifact
+2. The artifact contains a tampered `deploy.sh`
+3. A deployment workflow started by `workflow_run` downloads that artifact
+4. The destination is the workspace, so the legitimate `deploy.sh` is overwritten
+5. The deployment workflow executes it with production credentials
 
-    # Scan for malicious content
-    clamav-scan ${{ runner.temp }}/artifacts/
-```
+## Related Rules
 
-#### 3. Limit Artifact Scope
+- [permissions]({{< ref "permissions.md" >}}): narrow the workflow's permissions
+- [untrusted-checkout]({{< ref "untrustedcheckout.md" >}}): detect checkouts of untrusted code
+- [commit-sha]({{< ref "commitsharule.md" >}}): pin actions to a commit SHA
 
-Minimize what artifacts can contain and where they're used:
+## Rule Specific Guide
 
-```yaml
-# Good: Specific artifact with limited scope
-- uses: actions/download-artifact@v4
-  with:
-    name: test-results
-    path: ${{ runner.temp }}/test-results
-
-# Bad: Downloading all artifacts to workspace
-- uses: actions/download-artifact@v4
-  # No path specified - downloads all artifacts to current directory!
-```
-
-#### 4. Use Separate Workflows for Privileged Operations
-
-Isolate workflows with production access from untrusted inputs:
-
-```yaml
-# Build workflow (runs on PR, untrusted)
-name: Build
-on: [pull_request]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: npm run build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: build-output
-          path: dist/
-
----
-
-# Deploy workflow (runs on main only, trusted)
-name: Deploy
-on:
-  push:
-    branches: [main]
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write  # For OIDC
-    steps:
-      - uses: actions/checkout@v4  # Get trusted code
-      - run: npm run build  # Build from trusted source
-      # Don't download artifacts from PRs
-      - run: ./deploy.sh
-```
-
-#### 5. Implement Content Security Policies
-
-Restrict what can be executed from downloaded artifacts:
-
-```yaml
-- name: Configure security policy
-  run: |
-    # Disable execution of downloaded files
-    find ${{ runner.temp }}/artifacts -type f -exec chmod -x {} \;
-
-- name: Selectively enable execution
-  run: |
-    # Only enable execution after validation
-    if verify-signature ${{ runner.temp }}/artifacts/deploy.sh; then
-      chmod +x ${{ runner.temp }}/artifacts/deploy.sh
-    fi
-```
-
-### Real-World Attack Vectors
-
-#### Attack Vector 1: Pull Request Poisoning
-
-**Scenario**: Attacker creates PR with malicious artifact that gets executed in privileged workflow
-
-```yaml
-# Vulnerable: PR builds upload artifacts, deploy workflow downloads them
-on:
-  workflow_run:
-    workflows: ["PR Build"]
-    types: [completed]
-```
-
-**Mitigation**: Separate build and deploy, only deploy from trusted branches
-
-#### Attack Vector 2: Dependency Chain Poisoning
-
-**Scenario**: Compromised dependency uploads malicious artifacts during build
-
-```yaml
-# Vulnerable: Build process controlled by dependencies
-steps:
-  - run: npm install  # Compromised package
-  - run: npm run build  # Malicious build script uploads poisoned artifact
-```
-
-**Mitigation**: Use dependency pinning, verify artifact integrity, scan for malware
-
-#### Attack Vector 3: Cross-Workflow Contamination
-
-**Scenario**: Multiple workflows share artifact namespace, attacker poisons shared artifact
-
-```yaml
-# Workflow A uploads "config" artifact
-- uses: actions/upload-artifact@v4
-  with:
-    name: config
-
-# Workflow B downloads "config" artifact (could be poisoned)
-- uses: actions/download-artifact@v4
-  with:
-    name: config
-```
-
-**Mitigation**: Use unique artifact names with workflow/run IDs, validate sources
+Behaviour specific to this rule.
 
 ### OS-Aware Path Validation
 
-The rule infers the runner OS from `runs-on` labels and applies OS-specific path safety rules. This prevents false positives (e.g., flagging `/tmp/` as unsafe on Linux) and catches OS-specific risks (e.g., allowing `C:\` paths on Linux).
+The runner OS is inferred from the `runs-on` labels, and the safe destinations are decided per
+OS.
 
-#### OS Detection
+Matching is case-insensitive, and each row accepts either a prefix or an exact label.
 
-| `runs-on` Label | Detected OS |
-|-----------------|-------------|
-| `ubuntu-*`, `ubuntu-latest` | linux |
-| `windows-*`, `windows-latest` | windows |
-| `macos-*`, `macos-latest` | macos |
-| Matrix expressions, self-hosted (no OS label) | unknown |
+| `runs-on` label | inferred OS |
+|---|---|
+| `ubuntu-*` (`ubuntu-latest` …), or exactly `ubuntu` or `linux` | linux |
+| `windows-*` (`windows-latest` …), or exactly `windows` | windows |
+| `macos-*` (`macos-latest` …), or exactly `macos` or `mac` | macos |
+| an expression (`${{ matrix.os }}` etc.), or self-hosted with no OS label | unknown |
 
-#### Path Safety by OS
+| destination | Linux / macOS | Windows | unknown |
+|---|:---:|:---:|:---:|
+| `${{ runner.temp }}/...` | safe | safe | safe |
+| `$RUNNER_TEMP/...` | unsafe | unsafe | unsafe |
+| `/tmp/...` | safe | unsafe | safe |
+| `/var/...` | safe | unsafe | unsafe |
+| any other absolute Unix path (`/opt/...`, `/home/runner/work/...`) | unsafe | unsafe | unsafe |
+| absolute Windows paths (`C:\...`, `D:/...`) | unsafe | unsafe | unsafe |
 
-| Path | Linux/macOS | Windows | Unknown OS |
-|------|:-----------:|:-------:|:----------:|
-| `${{ runner.temp }}/...` | Safe | Safe | Safe |
-| `/tmp/...` | Safe | Unsafe | Safe |
-| Other Unix paths (`/var/...`) | Safe | Unsafe | Unsafe |
-| Windows paths (`C:\...`, `D:/...`) | Unsafe | Safe | Unsafe |
+Absolute Windows paths are judged unsafe on every OS: no literal Windows form is on the safe
+list. When the OS is unknown, only `${{ runner.temp }}` and `/tmp` are treated as safe.
 
-When the OS is unknown (e.g., matrix expressions or self-hosted runners without OS labels), the rule applies a conservative policy where only `${{ runner.temp }}` and `/tmp` are considered safe.
+For the spellings it lists, this table states what the implementation treats as safe, not what
+has been shown to lie outside the workspace. Allowing `/tmp` and `/var` on Linux and macOS assumes the GitHub-hosted
+layout, where the workspace is under `/home/runner/work/...`, and does not hold for a
+self-hosted runner. Where a self-hosted runner places its work directory cannot be determined
+from the workflow file. In fact `runs-on: [self-hosted, ubuntu-latest]` is inferred as `linux`,
+so a path under `/var` is not reported, while `runs-on: [self-hosted]` alone reports the same
+path. Only the runner's own temporary directory does not depend on where the runner places the
+workspace; the rule accepts the `${{ runner.temp }}` expression for it, ignoring whitespace and
+letter case inside `${{ }}`, and rejects it when a `..` segment follows, so
+`${{ runner.temp }}/../work` is reported. A literal `$RUNNER_TEMP` is not accepted: `with:`
+inputs are not shell-expanded, so the action receives that string as written and resolves it
+inside the workspace.
 
-#### Example: Cross-Platform Workflow
+Read the message with the table in mind. For a destination that is on the list under one OS and
+off it under another, the message still reads "Workspace-relative paths allow malicious
+artifacts to overwrite source code" — `/tmp/artifacts` under `windows-latest` is reported with
+that wording even though the path is not workspace-relative. The finding is about the list, not
+about a determination that the destination is in the workspace.
 
-```yaml
-jobs:
-  deploy-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/artifacts  # Safe on Linux
+### Not taking the artifact at all
 
-  deploy-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/artifacts  # UNSAFE on Windows - flagged!
+Moving the destination stops the overwrite. It does not stop the privileged job from consuming
+something a less-trusted run produced; Remediation says as much, and the not-detected example
+shows only that the overwrite is gone.
 
-  deploy-matrix:
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/artifacts  # Safe on all OSes
-```
+A pipeline can avoid the question instead of answering it. Build and deploy in separate
+workflows: the build runs on the pull request without privileges, and the deploy runs from a
+trusted ref and builds what it needs from the checked-out source rather than downloading an
+artifact a pull request produced. Nothing crosses from the less-trusted run into the privileged
+one, and this rule reports nothing because there is no download step left to look at.
 
-### Detection Patterns
+This is not something the rule checks, and it is not always available — some pipelines exist
+precisely to hand a built artifact to a deploy job, and rebuilding is not free. Where it is
+available, it removes the risk rather than relocating it.
 
-The artifact-poisoning rule detects the following unsafe patterns:
+## References
 
-1. **Missing path parameter**:
-   ```yaml
-   - uses: actions/download-artifact@v4
-     with:
-       name: my-artifact
-       # Missing: path parameter
-   ```
-
-2. **Empty path parameter**:
-   ```yaml
-   - uses: actions/download-artifact@v4
-     with:
-       name: my-artifact
-       path: ""  # Empty path
-   ```
-
-3. **Workspace path parameter**:
-   ```yaml
-   - uses: actions/download-artifact@v4
-     with:
-       name: my-artifact
-       path: .  # Current directory - unsafe
-   ```
-
-### Safe Patterns
-
-The rule recognizes these patterns as safe:
-
-1. **Temporary directory isolation**:
-   ```yaml
-   - uses: actions/download-artifact@v4
-     with:
-       name: my-artifact
-       path: ${{ runner.temp }}/artifacts
-   ```
-
-2. **Custom temporary path**:
-   ```yaml
-   - uses: actions/download-artifact@v4
-     with:
-       name: my-artifact
-       path: ${{ runner.temp }}/my-safe-location
-   ```
-
-### Integration with GitHub Security Features
-
-This rule complements GitHub's native security features:
-
-- **CODEOWNERS**: Require review for workflow changes
-- **Branch Protection**: Prevent direct pushes to protected branches
-- **Required Status Checks**: Ensure sisakulint passes before merge
-- **Deployment Protection Rules**: Require approval for production deployments
-- **OpenID Connect (OIDC)**: Use short-lived tokens instead of long-lived secrets
-
-### CodeQL Integration
-
-This rule is inspired by CodeQL's artifact-poisoning query:
-- [CodeQL Query: Artifact Poisoning (Critical)](https://codeql.github.com/codeql-query-help/actions/actions-artifact-poisoning-critical/)
-
-sisakulint provides:
-- Faster feedback during development
-- Auto-fix capabilities
-- Integration with CI/CD pipelines
-- No GitHub Advanced Security license required
-
-### OWASP CI/CD Security Alignment
-
-This rule addresses multiple OWASP CI/CD Security Risks:
-
-**CICD-SEC-4: Poisoned Pipeline Execution (PPE)**
-- Prevents malicious artifacts from executing in privileged contexts
-- Isolates untrusted content from execution environment
-
-### Complementary Rules
-
-Use these rules together for comprehensive protection:
-
-1. **permissions rule**: Limit workflow permissions
-   ```yaml
-   permissions:
-     contents: read  # Don't allow write access
-   ```
-
-2. **timeout-minutes rule**: Prevent resource exhaustion
-   ```yaml
-   timeout-minutes: 10  # Limit execution time
-   ```
-
-3. **issue-injection rule**: Prevent command injection from artifacts
-   ```yaml
-   # Use environment variables, not direct interpolation
-   env:
-     ARTIFACT_NAME: ${{ github.event.inputs.name }}
-   ```
-
-4. **commit-sha rule**: Pin actions to prevent supply chain attacks
-   ```yaml
-   - uses: actions/download-artifact@6b208ae046db98c579e8a3aa621ab581ff575935
-   ```
-
-### Configuration
-
-To customize the artifact-poisoning rule behavior, configure `.github/action.yaml`:
-
-```yaml
-# Currently no configuration options available
-# Rule always enforces safe artifact extraction paths
-```
-
-### Performance Considerations
-
-This rule has minimal performance impact:
-- **Detection**: O(n) where n is the number of steps
-- **Auto-fix**: Modifies YAML structure in-place
-- **No Network Calls**: Purely static analysis
-
-### See Also
-
-**Industry References:**
-- [CodeQL: Artifact Poisoning (Critical)](https://codeql.github.com/codeql-query-help/actions/actions-artifact-poisoning-critical/) - CodeQL's artifact poisoning detection
-- [GitHub: Security Hardening for GitHub Actions](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions) - Official GitHub security guidance
-- [OWASP: CICD-SEC-04 - Poisoned Pipeline Execution](https://owasp.org/www-project-top-10-ci-cd-security-risks/CICD-SEC-04-Poisoned-Pipeline-Execution) - PPE attack patterns
-- [CWE-829: Inclusion of Functionality from Untrusted Control Sphere](https://cwe.mitre.org/data/definitions/829.html) - Vulnerability classification
-- [GitHub Docs: Storing Workflow Data as Artifacts](https://docs.github.com/en/actions/using-workflows/storing-workflow-data-as-artifacts) - Artifact usage guidelines
-
-{{< popup_link2 href="https://codeql.github.com/codeql-query-help/actions/actions-artifact-poisoning-critical/" >}}
-
-{{< popup_link2 href="https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions" >}}
-
-{{< popup_link2 href="https://owasp.org/www-project-top-10-ci-cd-security-risks/CICD-SEC-04-Poisoned-Pipeline-Execution" >}}
-
-{{< popup_link2 href="https://cwe.mitre.org/data/definitions/829.html" >}}
-
-{{< popup_link2 href="https://docs.github.com/en/actions/using-workflows/storing-workflow-data-as-artifacts" >}}
+- [actions/download-artifact README (`484a0b52`)](https://github.com/actions/download-artifact/blob/484a0b528fb4d7bd804637ccb632e47a0e638317/README.md#inputs)
+  — `path` defaults to `$GITHUB_WORKSPACE`; a `github-token` is required to download from a
+  different repository or workflow run. Both inputs read the same way in `v4`, which the examples
+  above use
+- [CodeQL: Artifact Poisoning (Critical)](https://codeql.github.com/codeql-query-help/actions/actions-artifact-poisoning-critical/)
+- [GitHub: Secure use reference](https://docs.github.com/en/actions/reference/security/secure-use)
+- [GitHub: Securely using `pull_request_target`](https://docs.github.com/en/actions/reference/security/securely-using-pull_request_target)
+  — a pull request from a fork runs `pull_request` / `pull_request_review` /
+  `pull_request_review_comment` with a read-only `GITHUB_TOKEN` and without other secrets
+- [OWASP: CICD-SEC-04 - Poisoned Pipeline Execution](https://owasp.org/www-project-top-10-ci-cd-security-risks/CICD-SEC-04-Poisoned-Pipeline-Execution)
+- [CWE-829: Inclusion of Functionality from Untrusted Control Sphere](https://cwe.mitre.org/data/definitions/829.html)
+- [GitHub: Store and share data with workflow artifacts](https://docs.github.com/en/actions/tutorials/store-and-share-data)
+- [GitHub: Artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)
+  — what a build attestation establishes and what it does not. It links an artifact to the source
+  and the build instructions that produced it; GitHub states it is not a guarantee that the
+  artifact is secure, and leaves the policy criteria to the consumer
+- [Rule source (`v0.3.7`)](https://github.com/sisaku-security/sisakulint/blob/v0.3.7/pkg/core/artifactpoisoningcritical.go)
